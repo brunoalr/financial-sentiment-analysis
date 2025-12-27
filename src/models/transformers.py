@@ -22,10 +22,13 @@ from transformers import (
     pipeline,
 )
 
-from src.config import DEFAULT_TRAINING_ARGS, MODELS_DIR, SEED, SUBMISSIONS_DIR
+from src.config import DEFAULT_TRAINING_ARGS, MODELS_DIR, SEED
 from src.evaluation import compute_metrics, plot_confusion_matrix
 from src.models.dataset import FinancialNewsDataset
-from src.submission import generate_submission_transformers
+from src.submission import (
+    generate_submission,
+    generate_submission_transformers,
+)
 import src.utils as utils
 from src.utils import get_device
 
@@ -127,6 +130,7 @@ def _create_datasets(
     y_train: Union[np.ndarray, pd.Series],
     y_val: Union[np.ndarray, pd.Series],
     tokenizer: AutoTokenizer,
+    y_test: Optional[Union[np.ndarray, pd.Series]] = None,
 ) -> tuple[FinancialNewsDataset, FinancialNewsDataset, FinancialNewsDataset]:
     """
     Create PyTorch datasets for training, validation, and test.
@@ -138,15 +142,35 @@ def _create_datasets(
         y_train: Training labels
         y_val: Validation labels
         tokenizer: AutoTokenizer instance from transformers
+        y_test: Optional test labels. If None, dummy labels are used
 
     Returns:
         tuple: (train_dataset, val_dataset, test_dataset)
+
+    Raises:
+        ValueError: If y_test length doesn't match df_test length
     """
-    train_dataset = FinancialNewsDataset(df_train["text"].values, y_train, tokenizer)
-    val_dataset = FinancialNewsDataset(df_val["text"].values, y_val, tokenizer)
+    train_dataset = FinancialNewsDataset(
+        df_train["text"].values, y_train, tokenizer
+    )
+    val_dataset = FinancialNewsDataset(
+        df_val["text"].values, y_val, tokenizer
+    )
+    # Use provided test labels or dummy labels
+    if y_test is not None:
+        if len(y_test) != len(df_test):
+            raise ValueError(
+                f"Length mismatch: y_test has {len(y_test)} samples, "
+                f"but df_test has {len(df_test)} samples. "
+                f"They must have the same length."
+            )
+        test_labels = y_test
+    else:
+        test_labels = np.zeros(len(df_test))
+
     test_dataset = FinancialNewsDataset(
-        df_test["text"].values, np.zeros(len(df_test)), tokenizer
-    )  # Dummy labels for test
+        df_test["text"].values, test_labels, tokenizer
+    )
 
     return train_dataset, val_dataset, test_dataset
 
@@ -184,7 +208,7 @@ def _load_existing_model(
         Trainer: Trainer instance from transformers
     """
     model_ft = AutoModelForSequenceClassification.from_pretrained(
-        model_save_path, num_labels=3, output_attentions=True
+        model_save_path, num_labels=3, output_attentions=False
     )
 
     _print_model_info(model_ft)
@@ -242,7 +266,7 @@ def _train_new_model(
     """
     # Load base model for training
     model_ft = AutoModelForSequenceClassification.from_pretrained(
-        model_name, num_labels=3, output_attentions=True
+        model_name, num_labels=3, output_attentions=False
     )
 
     _print_model_info(model_ft)
@@ -272,7 +296,10 @@ def _train_new_model(
 
 
 def _plot_confusion_matrix_from_trainer(
-    trainer_ft: Trainer, dataset: FinancialNewsDataset, title: str
+    trainer_ft: Trainer,
+    dataset: FinancialNewsDataset,
+    title: str,
+    batch_size: Optional[int] = None,
 ) -> None:
     """
     Plot confusion matrix from trainer predictions.
@@ -281,25 +308,39 @@ def _plot_confusion_matrix_from_trainer(
         trainer_ft: Trainer instance from transformers
         dataset: FinancialNewsDataset to evaluate
         title: Title for the plot
+        batch_size: Optional batch size for prediction. If None, uses
+            trainer's default batch size. Use smaller batch size for
+            large datasets to avoid memory issues.
     """
     np.set_printoptions(precision=4, suppress=True)
 
-    # Get predictions (logits)
-    predictions_obj = trainer_ft.predict(dataset)
+    # Temporarily update batch size if specified
+    original_batch_size = None
+    if batch_size is not None:
+        original_batch_size = trainer_ft.args.per_device_eval_batch_size
+        trainer_ft.args.per_device_eval_batch_size = batch_size
 
-    # Handle format when output_attentions=True
-    logits = predictions_obj.predictions
-    if isinstance(logits, (list, tuple)) and len(logits) > 0:
-        logits = logits[0]
-    if isinstance(logits, torch.Tensor):
-        logits = logits.cpu().numpy()
-    if len(logits.shape) > 2:
-        logits = logits.reshape(-1, logits.shape[-1])
+    try:
+        # Get predictions (logits)
+        predictions_obj = trainer_ft.predict(dataset)
 
-    # Convert logits to classes
-    predictions = np.argmax(logits, axis=1)
-    labels = dataset.labels
-    plot_confusion_matrix(labels, predictions, title)
+        # Extract logits from predictions
+        logits = predictions_obj.predictions
+        if isinstance(logits, (list, tuple)) and len(logits) > 0:
+            logits = logits[0]
+        if isinstance(logits, torch.Tensor):
+            logits = logits.cpu().numpy()
+        if len(logits.shape) > 2:
+            logits = logits.reshape(-1, logits.shape[-1])
+
+        # Convert logits to classes
+        predictions = np.argmax(logits, axis=1)
+        labels = dataset.labels
+        plot_confusion_matrix(labels, predictions, title)
+    finally:
+        # Restore original batch size
+        if original_batch_size is not None:
+            trainer_ft.args.per_device_eval_batch_size = original_batch_size
 
 
 def _evaluate_and_submit(
@@ -359,6 +400,7 @@ def train_and_evaluate_model(
     df_test: Optional[pd.DataFrame] = None,
     y_train: Optional[Union[np.ndarray, pd.Series]] = None,
     y_val: Optional[Union[np.ndarray, pd.Series]] = None,
+    y_test: Optional[Union[np.ndarray, pd.Series]] = None,
     tokenizer_name: Optional[str] = None,
     results_val: Optional[Dict[str, float]] = None,
     results_val_per_type: Optional[Dict[str, Dict[str, float]]] = None,
@@ -375,6 +417,7 @@ def train_and_evaluate_model(
         df_test: Test DataFrame
         y_train: Training labels
         y_val: Validation labels
+        y_test: Optional test labels. If None, dummy labels are used
         tokenizer_name: Optional tokenizer name
         results_val: Dictionary to store validation results
         results_val_per_type: Dictionary to store results per type
@@ -404,7 +447,7 @@ def train_and_evaluate_model(
 
     # Create datasets
     train_dataset, val_dataset, test_dataset = _create_datasets(
-        df_train, df_val, df_test, y_train, y_val, tokenizer
+        df_train, df_val, df_test, y_train, y_val, tokenizer, y_test
     )
 
     # Load existing model or train new one
@@ -426,6 +469,16 @@ def train_and_evaluate_model(
     _plot_confusion_matrix_from_trainer(
         trainer_ft, val_dataset, f"{model_name} - Fine-Tuned"
     )
+
+    # Plot test confusion matrix if test labels are available
+    # Use smaller batch size for test dataset to avoid memory issues
+    if y_test is not None:
+        _plot_confusion_matrix_from_trainer(
+            trainer_ft,
+            test_dataset,
+            f"{model_name} - Test",
+            batch_size=8,  # Smaller batch size to avoid memory issues
+        )
 
     # Evaluate and generate submission
     if results_val is not None and results_val_per_type is not None:
@@ -476,6 +529,7 @@ def evaluate_zero_shot_model(
     df_val: pd.DataFrame,
     y_val: Union[np.ndarray, pd.Series],
     df_test: pd.DataFrame,
+    y_test: Optional[Union[np.ndarray, pd.Series]] = None,
     results_val: Optional[Dict[str, float]] = None,
     results_val_per_type: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> None:
@@ -488,6 +542,8 @@ def evaluate_zero_shot_model(
         df_val: Validation DataFrame
         y_val: Validation labels
         df_test: Test DataFrame
+        y_test: Optional test labels. If provided, confusion matrix will be
+            plotted for test set
         results_val: Dictionary to store validation results
         results_val_per_type: Dictionary to store results per type
     """
@@ -513,17 +569,24 @@ def evaluate_zero_shot_model(
 
     plot_confusion_matrix(y_val, y_pred, name_pre_trained)
 
-    # Generate submission for test set
+    # Generate predictions for test set
     y_pred_test = get_zero_shot_predictions(classifier, df_test, batch_size)
 
-    # Create submission DataFrame
+    # Plot test confusion matrix if test labels are available
+    if y_test is not None:
+        plot_confusion_matrix(
+            y_test,
+            y_pred_test,
+            f"{model_name} - zero-shot (pre-trained) - Test",
+        )
+
+    # Generate submission file (will skip if ID column is missing)
     model_name_safe = model_name.replace("/", "_").replace("-", "_")
-    submission = pd.DataFrame({"ID": df_test["ID"], "TARGET": y_pred_test})
-    submission_filename = os.path.join(
-        SUBMISSIONS_DIR, f"submission_{model_name_safe}_zero_shot_pre_trained.csv"
+    generate_submission(
+        y_pred_test,
+        df_test,
+        f"{model_name_safe}_zero_shot_pre_trained",
     )
-    submission.to_csv(submission_filename, index=False)
-    print(f"File '{submission_filename}' generated successfully!")
 
 
 def get_sentiment_predictions(
@@ -543,7 +606,9 @@ def get_sentiment_predictions(
     predictions = []
     for i in range(0, len(df), batch_size):
         batch_texts = df["text"].iloc[i : i + batch_size].tolist()
-        batch_preds = classifier(batch_texts)
+        batch_preds = classifier(
+            batch_texts, truncation=True, max_length=512, padding=True
+        )
         predictions.extend(batch_preds)
 
     label_mapping = {
@@ -583,6 +648,7 @@ def evaluate_sentiment_model(
     df_val: pd.DataFrame,
     y_val: Union[np.ndarray, pd.Series],
     df_test: pd.DataFrame,
+    y_test: Optional[Union[np.ndarray, pd.Series]] = None,
     save_result: bool = True,
     results_val: Optional[Dict[str, float]] = None,
     results_val_per_type: Optional[Dict[str, Dict[str, float]]] = None,
@@ -596,6 +662,8 @@ def evaluate_sentiment_model(
         df_val: Validation DataFrame
         y_val: Validation labels
         df_test: Test DataFrame
+        y_test: Optional test labels. If provided, confusion matrix will be
+            plotted for test set
         save_result: Whether to save results
         results_val: Dictionary to store validation results
         results_val_per_type: Dictionary to store results per type
@@ -619,15 +687,22 @@ def evaluate_sentiment_model(
         if results_val_per_type is not None:
             results_val_per_type[model_type][name_pre_trained] = bal_acc
 
-    y_pred_test = get_sentiment_predictions(classifier, df_test, batch_size)
-
     plot_confusion_matrix(y_val, y_pred, name_pre_trained)
 
-    # Create submission DataFrame
+    y_pred_test = get_sentiment_predictions(classifier, df_test, batch_size)
+
+    # Plot test confusion matrix if test labels are available
+    if y_test is not None:
+        plot_confusion_matrix(
+            y_test,
+            y_pred_test,
+            f"{model_name} - sentiment (pre-trained) - Test",
+        )
+
+    # Generate submission file (will skip if ID column is missing)
     model_name_safe = model_name.replace("/", "_").replace("-", "_")
-    submission = pd.DataFrame({"ID": df_test["ID"], "TARGET": y_pred_test})
-    submission_filename = os.path.join(
-        SUBMISSIONS_DIR, f"submission_{model_name_safe}_sentiment_pre_trained.csv"
+    generate_submission(
+        y_pred_test,
+        df_test,
+        f"{model_name_safe}_sentiment_pre_trained",
     )
-    submission.to_csv(submission_filename, index=False)
-    print(f"File '{submission_filename}' generated successfully!")
