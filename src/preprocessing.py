@@ -15,7 +15,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.preprocessing.text import Tokenizer
 
-from src.config import MAX_LEN, MAX_NB_WORDS, TFIDF_MAX_FEATURES
+from src import config
 
 # Download stopwords (if necessary)
 try:
@@ -49,16 +49,17 @@ def clean_text(text: str, stop_words_set: Optional[Set[str]] = None) -> str:
     return " ".join(tokens)
 
 
-def create_tfidf_vectorizer(max_features: int = TFIDF_MAX_FEATURES) -> TfidfVectorizer:
+def create_tfidf_vectorizer(max_features: Optional[int] = None) -> TfidfVectorizer:
     """
     Create and return a TF-IDF vectorizer.
 
     Args:
-        max_features: Maximum number of features to use
+        max_features: Maximum number of features to use. If None, uses TFIDF_MAX_FEATURES from config.
 
     Returns:
         TfidfVectorizer instance
     """
+    max_features = max_features if max_features is not None else config.TFIDF_MAX_FEATURES
     return TfidfVectorizer(max_features=max_features)
 
 
@@ -98,16 +99,17 @@ def fit_transform_tfidf(
     return X_train_tfidf, X_val_tfidf, X_test_tfidf
 
 
-def create_lstm_tokenizer(max_nb_words: int = MAX_NB_WORDS) -> Tokenizer:
+def create_lstm_tokenizer(max_nb_words: Optional[int] = None) -> Tokenizer:
     """
     Create and return an LSTM tokenizer.
 
     Args:
-        max_nb_words: Maximum number of words to keep
+        max_nb_words: Maximum number of words to keep. If None, uses MAX_NB_WORDS from config.
 
     Returns:
         Tokenizer instance
     """
+    max_nb_words = max_nb_words if max_nb_words is not None else config.MAX_NB_WORDS
     return Tokenizer(num_words=max_nb_words, lower=True)
 
 
@@ -116,7 +118,7 @@ def fit_transform_lstm(
     train_texts: list[str],
     val_texts: Optional[list[str]] = None,
     test_texts: Optional[list[str]] = None,
-    max_len: int = MAX_LEN,
+    max_len: Optional[int] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Fit LSTM tokenizer on training data and transform all datasets.
@@ -126,11 +128,12 @@ def fit_transform_lstm(
         train_texts: Training text data
         val_texts: Optional validation text data
         test_texts: Optional test text data
-        max_len: Maximum sequence length
+        max_len: Maximum sequence length. If None, uses MAX_LEN from config.
 
     Returns:
         tuple: (X_train_seq, X_val_seq, X_test_seq) padded sequences
     """
+    max_len = max_len if max_len is not None else config.MAX_LEN
     tokenizer.fit_on_texts(train_texts)
 
     X_train_seq = pad_sequences(

@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import balanced_accuracy_score
+from tqdm import tqdm
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -22,7 +23,7 @@ from transformers import (
     pipeline,
 )
 
-from src.config import DEFAULT_TRAINING_ARGS, MODELS_DIR, SEED
+from src import config
 from src.evaluation import compute_metrics, plot_confusion_matrix
 from src.models.dataset import FinancialNewsDataset
 from src.submission import (
@@ -57,10 +58,10 @@ def _prepare_model_path(model_name: str) -> str:
         base_name = model_name.replace("/", "_").replace("-", "_")
 
     model_name_safe = base_name.replace("/", "_").replace("-", "_")
-    model_save_path = os.path.join(MODELS_DIR, f"{model_name_safe}_fine_tuned")
+    model_save_path = os.path.join(config.MODELS_DIR, f"{model_name_safe}_fine_tuned")
 
     # Create models directory if it doesn't exist
-    os.makedirs(MODELS_DIR, exist_ok=True)
+    os.makedirs(config.MODELS_DIR, exist_ok=True)
 
     return model_save_path
 
@@ -217,8 +218,8 @@ def _load_existing_model(
     training_args = TrainingArguments(
         output_dir=None,
         per_device_eval_batch_size=32,
-        seed=SEED,
-        data_seed=SEED,
+        seed=config.SEED,
+        data_seed=config.SEED,
         report_to="none",
     )
 
@@ -247,7 +248,7 @@ def _train_new_model(
     val_dataset: FinancialNewsDataset,
     tokenizer: AutoTokenizer,
     compute_metrics_func: Callable[[EvalPrediction], Dict[str, float]],
-    training_args: TrainingArguments = DEFAULT_TRAINING_ARGS,
+    training_args: Optional[TrainingArguments] = None,
 ) -> Trainer:
     """
     Train a new transformer model.
@@ -259,11 +260,16 @@ def _train_new_model(
         val_dataset: Validation dataset
         tokenizer: AutoTokenizer instance from transformers
         compute_metrics_func: Function to compute metrics
-        training_args: Training arguments
+        training_args: Training arguments. If None, uses DEFAULT_TRAINING_ARGS from config.
 
     Returns:
         Trainer: Trainer instance from transformers
     """
+    training_args = (
+        training_args
+        if training_args is not None
+        else config.DEFAULT_TRAINING_ARGS
+    )
     # Load base model for training
     model_ft = AutoModelForSequenceClassification.from_pretrained(
         model_name, num_labels=3, output_attentions=False
@@ -394,7 +400,7 @@ def _evaluate_and_submit(
 def train_and_evaluate_model(
     model_name: str,
     type_name: str,
-    training_args: TrainingArguments = DEFAULT_TRAINING_ARGS,
+    training_args: Optional[TrainingArguments] = None,
     df_train: Optional[pd.DataFrame] = None,
     df_val: Optional[pd.DataFrame] = None,
     df_test: Optional[pd.DataFrame] = None,
@@ -411,7 +417,7 @@ def train_and_evaluate_model(
     Args:
         model_name: Name of the base model
         type_name: Type/category of the model
-        training_args: Training arguments
+        training_args: Training arguments. If None, uses DEFAULT_TRAINING_ARGS from config.
         df_train: Training DataFrame
         df_val: Validation DataFrame
         df_test: Test DataFrame
@@ -425,6 +431,11 @@ def train_and_evaluate_model(
     Returns:
         Trainer: Trainer instance from transformers
     """
+    training_args = (
+        training_args
+        if training_args is not None
+        else config.DEFAULT_TRAINING_ARGS
+    )
     print("=" * 100)
     print(f"Evaluating {model_name} on validation set...")
     print("=" * 100)
@@ -497,7 +508,10 @@ def train_and_evaluate_model(
 
 
 def get_zero_shot_predictions(
-    classifier: Pipeline, df: pd.DataFrame, batch_size: int
+    classifier: Pipeline,
+    df: pd.DataFrame,
+    batch_size: int,
+    desc: str = "Processing batches",
 ) -> list[int]:
     """
     Get zero-shot predictions from a classifier pipeline.
@@ -506,6 +520,7 @@ def get_zero_shot_predictions(
         classifier: transformers.Pipeline for zero-shot classification
         df: DataFrame with 'text' column
         batch_size: Batch size for processing
+        desc: Description for progress bar
 
     Returns:
         list: Predicted labels
@@ -513,8 +528,12 @@ def get_zero_shot_predictions(
     label_mapping = {"positive": 1, "neutral": 0, "negative": 2}
     candidate_labels = ["positive", "neutral", "negative"]
     y_pred = []
-    for i in range(0, len(df), batch_size):
-        batch_texts = df["text"].iloc[i : i + batch_size].tolist()
+
+    total_batches = (len(df) + batch_size - 1) // batch_size
+    for i in tqdm(
+        range(0, len(df), batch_size), desc=desc, total=total_batches
+    ):
+        batch_texts = df["text"].iloc[i:i + batch_size].tolist()
         batch_preds = classifier(batch_texts, candidate_labels)
         for pred in batch_preds:
             # Get label with highest score
@@ -557,7 +576,10 @@ def evaluate_zero_shot_model(
 
     batch_size = 16
 
-    y_pred = get_zero_shot_predictions(classifier, df_val, batch_size)
+    print(f"\nProcessing validation set ({len(df_val)} samples)...")
+    y_pred = get_zero_shot_predictions(
+        classifier, df_val, batch_size, desc="Validation batches"
+    )
     bal_acc = balanced_accuracy_score(y_val, y_pred)
     print(f"Balanced Accuracy: {bal_acc:.5f}")
     name_pre_trained = f"{model_name} - zero-shot (pre-trained)"
@@ -570,7 +592,10 @@ def evaluate_zero_shot_model(
     plot_confusion_matrix(y_val, y_pred, name_pre_trained)
 
     # Generate predictions for test set
-    y_pred_test = get_zero_shot_predictions(classifier, df_test, batch_size)
+    print(f"\nProcessing test set ({len(df_test)} samples)...")
+    y_pred_test = get_zero_shot_predictions(
+        classifier, df_test, batch_size, desc="Test batches"
+    )
 
     # Plot test confusion matrix if test labels are available
     if y_test is not None:
@@ -590,7 +615,10 @@ def evaluate_zero_shot_model(
 
 
 def get_sentiment_predictions(
-    classifier: Pipeline, df: pd.DataFrame, batch_size: int
+    classifier: Pipeline,
+    df: pd.DataFrame,
+    batch_size: int,
+    desc: str = "Processing batches",
 ) -> list[int]:
     """
     Get sentiment predictions from a sentiment analysis pipeline.
@@ -599,13 +627,17 @@ def get_sentiment_predictions(
         classifier: transformers.Pipeline for sentiment analysis
         df: DataFrame with 'text' column
         batch_size: Batch size for processing
+        desc: Description for progress bar
 
     Returns:
         list: Predicted labels
     """
     predictions = []
-    for i in range(0, len(df), batch_size):
-        batch_texts = df["text"].iloc[i : i + batch_size].tolist()
+    total_batches = (len(df) + batch_size - 1) // batch_size
+    for i in tqdm(
+        range(0, len(df), batch_size), desc=desc, total=total_batches
+    ):
+        batch_texts = df["text"].iloc[i:i + batch_size].tolist()
         batch_preds = classifier(
             batch_texts, truncation=True, max_length=512, padding=True
         )
@@ -672,11 +704,16 @@ def evaluate_sentiment_model(
     print(f"Evaluating: {model_name} - sentiment-analysis (pre-trained)")
     print(f"{'-' * 100}")
 
-    classifier = pipeline("sentiment-analysis", model=model_name, device=get_device())
+    classifier = pipeline(
+        "sentiment-analysis", model=model_name, device=get_device()
+    )
 
     batch_size = 32
 
-    y_pred = get_sentiment_predictions(classifier, df_val, batch_size)
+    print(f"\nProcessing validation set ({len(df_val)} samples)...")
+    y_pred = get_sentiment_predictions(
+        classifier, df_val, batch_size, desc="Validation batches"
+    )
     bal_acc = balanced_accuracy_score(y_val, y_pred)
     print(f"Balanced Accuracy: {bal_acc:.5f}")
     name_pre_trained = f"{model_name} - sentiment (pre-trained)"
@@ -689,7 +726,10 @@ def evaluate_sentiment_model(
 
     plot_confusion_matrix(y_val, y_pred, name_pre_trained)
 
-    y_pred_test = get_sentiment_predictions(classifier, df_test, batch_size)
+    print(f"\nProcessing test set ({len(df_test)} samples)...")
+    y_pred_test = get_sentiment_predictions(
+        classifier, df_test, batch_size, desc="Test batches"
+    )
 
     # Plot test confusion matrix if test labels are available
     if y_test is not None:
