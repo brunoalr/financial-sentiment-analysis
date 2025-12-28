@@ -4,6 +4,7 @@ LLM (Large Language Model) evaluation functions
 
 from __future__ import annotations
 
+import gc
 import os
 import time
 from typing import Optional, Tuple, Union
@@ -24,14 +25,29 @@ from src.evaluation import plot_confusion_matrix
 from src.submission import generate_submission
 from src.utils import get_device
 
+
+def _clear_memory_cache() -> None:
+    """Clear memory caches for all available backends."""
+    # Clear CUDA cache if available
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Clear MPS cache if available (macOS)
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+    # Force garbage collection
+    gc.collect()
+
+
 # Constants
 DEFAULT_NEUTRAL_LABEL = "   Defaulting to neutral (0)"
 
 # Default SFT training parameters
 DEFAULT_SFT_LEARNING_RATE = 2e-5
-DEFAULT_SFT_BATCH_SIZE = 4
+DEFAULT_SFT_BATCH_SIZE = 8
 DEFAULT_SFT_NUM_EPOCHS = 3
-DEFAULT_SFT_MAX_SEQ_LENGTH = 512
+DEFAULT_SFT_MAX_SEQ_LENGTH = 64
 
 
 def _get_sentiment_instruction() -> str:
@@ -415,6 +431,10 @@ def train_llm_sft(
     tokenizer.save_pretrained(output_dir)
     print(f"Model saved to: {output_dir}")
 
+    # Clear memory caches after training
+    _clear_memory_cache()
+    del trainer
+
     return model, tokenizer
 
 
@@ -453,6 +473,7 @@ def evaluate_llm(
     Raises:
         ValueError: If train_sft=True but df_train is not provided
     """
+    _clear_memory_cache()
     # Validate inputs
     if df is None or df.empty:
         raise ValueError("df cannot be None or empty")
@@ -531,6 +552,10 @@ def evaluate_llm(
         predictions = _process_texts_llm(texts, model, tokenizer, desc)
         balanced_acc = balanced_accuracy_score(y, predictions)
         plot_confusion_matrix(y, predictions, f"{model_display_name} (LLM)")
+
+        # Clear memory caches after evaluation
+        _clear_memory_cache()
+
         return balanced_acc, predictions
 
     # Process test set if provided (without validation labels)
@@ -543,6 +568,9 @@ def evaluate_llm(
     _create_submission_file_direct(
         test_predictions, df, submission_model_name
     )
+
+    # Clear memory caches after evaluation
+    _clear_memory_cache()
 
     return None, test_predictions
 
