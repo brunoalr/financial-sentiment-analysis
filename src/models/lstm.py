@@ -20,14 +20,14 @@ from keras.layers import (
 from keras.models import Sequential
 from keras.utils import to_categorical
 
+from src import config
 from src import utils
-from src.config import EMBEDDING_DIM, MAX_NB_WORDS
 from src.evaluation import plot_confusion_matrix
 
 
 def create_lstm_model(
-    max_nb_words: int = MAX_NB_WORDS,
-    embedding_dim: int = EMBEDDING_DIM,
+    max_nb_words: Optional[int] = None,
+    embedding_dim: Optional[int] = None,
     lstm_units: int = 128,
     dense_units: int = 64,
     dropout_rate: float = 0.3,
@@ -36,8 +36,8 @@ def create_lstm_model(
     Create a bidirectional LSTM model.
 
     Args:
-        max_nb_words: Maximum number of words in vocabulary
-        embedding_dim: Embedding dimension
+        max_nb_words: Maximum number of words in vocabulary. If None, uses MAX_NB_WORDS from config.
+        embedding_dim: Embedding dimension. If None, uses EMBEDDING_DIM from config.
         lstm_units: Number of LSTM units
         dense_units: Number of dense layer units
         dropout_rate: Dropout rate
@@ -45,6 +45,8 @@ def create_lstm_model(
     Returns:
         Compiled Keras Sequential model
     """
+    max_nb_words = max_nb_words if max_nb_words is not None else config.MAX_NB_WORDS
+    embedding_dim = embedding_dim if embedding_dim is not None else config.EMBEDDING_DIM
     model = Sequential(
         [
             Embedding(max_nb_words, embedding_dim),
@@ -146,8 +148,8 @@ def train_and_evaluate_lstm(
     epochs: int = 10,
     batch_size: int = 64,
     results_dict: Optional[Dict[str, float]] = None,
-    max_nb_words: int = MAX_NB_WORDS,
-    embedding_dim: int = EMBEDDING_DIM,
+    max_nb_words: Optional[int] = None,
+    embedding_dim: Optional[int] = None,
 ) -> Tuple[Sequential, keras.callbacks.History, float, np.ndarray]:
     """
     Train and evaluate an LSTM model end-to-end.
@@ -160,8 +162,8 @@ def train_and_evaluate_lstm(
         epochs: Number of training epochs
         batch_size: Batch size
         results_dict: Optional dictionary to store results
-        max_nb_words: Maximum number of words in vocabulary
-        embedding_dim: Embedding dimension
+        max_nb_words: Maximum number of words in vocabulary. If None, uses MAX_NB_WORDS from config.
+        embedding_dim: Embedding dimension. If None, uses EMBEDDING_DIM from config.
 
     Returns:
         tuple: (trained_model: Sequential, history: keras.callbacks.History,

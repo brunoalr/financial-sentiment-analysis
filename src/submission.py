@@ -21,7 +21,7 @@ def generate_submission(
     predictions: Union[np.ndarray, list[int]],
     df_test: pd.DataFrame,
     model_name: str,
-) -> str:
+) -> str | None:
     """
     Generate submission CSV file.
 
@@ -31,8 +31,16 @@ def generate_submission(
         model_name: Name of the model for filename
 
     Returns:
-        str: Path to saved submission file
+        str: Path to saved submission file, or None if 'ID' column is missing
     """
+    # Skip submission generation if 'ID' column is missing
+    if "ID" not in df_test.columns:
+        print(
+            f"Skipping submission generation: 'ID' column not found in "
+            f"df_test. Available columns: {list(df_test.columns)}"
+        )
+        return None
+
     submission = pd.DataFrame({"ID": df_test["ID"], "TARGET": predictions})
     model_name_safe = model_name.replace("/", "_").replace("-", "_")
     submission_filename = f"{SUBMISSIONS_DIR}/submission_{model_name_safe}.csv"
@@ -46,7 +54,7 @@ def generate_submission_transformers(
     model_name: str,
     test_dataset: Dataset,
     df_test: pd.DataFrame,
-) -> str:
+) -> str | None:
     """
     Generate submission file for transformer models.
 
@@ -57,8 +65,16 @@ def generate_submission_transformers(
         df_test: Test DataFrame with 'ID' column
 
     Returns:
-        str: Path to saved submission file
+        str: Path to saved submission file, or None if 'ID' column is missing
     """
+    # Skip submission generation if 'ID' column is missing
+    if "ID" not in df_test.columns:
+        print(
+            f"Skipping submission generation: 'ID' column not found in "
+            f"df_test. Available columns: {list(df_test.columns)}"
+        )
+        return None
+
     # BERT models need specific tokenization
     print(f"Using {model_name} for prediction...")
     predictions = trainer.predict(test_dataset)

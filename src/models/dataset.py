@@ -2,14 +2,13 @@
 Base classes and utilities for models
 """
 
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from src.config import TRANSFORMER_MAX_LEN
-
+from src import config
 
 from transformers.tokenization_utils_base import (
     PreTrainedTokenizerBase,
@@ -26,7 +25,7 @@ class FinancialNewsDataset(Dataset):
         texts: Union[list[str], np.ndarray],
         labels: Union[list[int], np.ndarray],
         tokenizer: PreTrainedTokenizerBase,
-        max_len: int = TRANSFORMER_MAX_LEN,
+        max_len: Optional[int] = None,
     ) -> None:
         """
         Initialize the dataset.
@@ -35,14 +34,15 @@ class FinancialNewsDataset(Dataset):
             texts: Array of text strings
             labels: Array of numeric labels
             tokenizer: Hugging Face tokenizer
-            max_len: Maximum sequence length
+            max_len: Maximum sequence length. If None, uses TRANSFORMER_MAX_LEN from config.
         """
         self.texts = texts
         self.labels = (
             np.asarray(labels) if not isinstance(labels, np.ndarray) else labels
         )
         self.tokenizer = tokenizer
-        self.max_len = max_len
+        # Access via module to get latest value when autoreload is enabled
+        self.max_len = max_len if max_len is not None else config.TRANSFORMER_MAX_LEN
 
     def __len__(self) -> int:
         """Return the size of the dataset."""
