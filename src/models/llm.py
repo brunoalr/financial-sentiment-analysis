@@ -14,9 +14,12 @@ import torch
 from openai import OpenAI
 from sklearn.metrics import balanced_accuracy_score
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 
-from src.config import SUBMISSIONS_DIR
+from datasets import Dataset
+from trl import SFTTrainer
+
+from src.config import MODELS_DIR, SUBMISSIONS_DIR
 from src.evaluation import plot_confusion_matrix
 from src.submission import generate_submission
 from src.utils import get_device
@@ -24,10 +27,19 @@ from src.utils import get_device
 # Constants
 DEFAULT_NEUTRAL_LABEL = "   Defaulting to neutral (0)"
 
+# Default SFT training parameters
+DEFAULT_SFT_LEARNING_RATE = 2e-5
+DEFAULT_SFT_BATCH_SIZE = 4
+DEFAULT_SFT_NUM_EPOCHS = 3
+DEFAULT_SFT_MAX_SEQ_LENGTH = 512
+
 
 def _get_sentiment_instruction() -> str:
     """Get the standardized instruction text for sentiment classification."""
-    return "Classify the financial sentiment as positive, neutral, or negative. Respond with only one word: positive, neutral, or negative."
+    return (
+        "Classify the financial sentiment as positive, neutral, or negative. "
+        "Respond with only one word: positive, neutral, or negative."
+    )
 
 
 def _map_response_to_label(response: str) -> int:
@@ -194,7 +206,9 @@ def _process_texts_chatgpt(
     """
     predictions = []
     for text in tqdm(texts, desc=desc):
-        pred_label = _process_single_text_chatgpt(text, client, model_name, max_retries)
+        pred_label = _process_single_text_chatgpt(
+            text, client, model_name, max_retries
+        )
         predictions.append(pred_label)
     return np.array(predictions)
 
@@ -240,36 +254,141 @@ def _create_submission_file_direct(
     print(f"File 'submission_{model_name_safe}.csv' generated successfully!")
 
 
-def evaluate_llm(
-    model_name: str,
-    df: pd.DataFrame,
-    y: Optional[Union[np.ndarray, pd.Series, list[int]]] = None,
-) -> Tuple[Optional[float], np.ndarray]:
+def _prepare_sft_model_path(model_name: str) -> str:
     """
-    Evaluate an LLM model on a dataset.
+    Prepare model save path for SFT fine-tuned models.
 
     Args:
-        model_name: Name/path of the LLM model
-        df: DataFrame with 'text' column
-        y: Optional labels
+        model_name: Name of the model
 
     Returns:
-        tuple: (balanced_accuracy, predictions) or (None, predictions)
-            if y is None
+        str: Model save path
     """
-    # Validate inputs
-    if df is None or df.empty:
-        raise ValueError("df_val cannot be None or empty")
-    if "text" not in df.columns:
-        raise ValueError("df must contain a 'text' column")
+    if model_name.startswith("models/"):
+        base_name = model_name.replace("models/", "").replace("/", "_")
+    else:
+        base_name = model_name.replace("/", "_").replace("-", "_")
 
-    texts = df["text"].values
-    print(f"Evaluating model: {model_name}")
-    print(f"Evaluating {len(texts)} samples...")
+    model_name_safe = base_name.replace("/", "_").replace("-", "_")
+    model_save_path = os.path.join(MODELS_DIR, f"{model_name_safe}_sft")
 
-    # Load model with error handling
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    # Create models directory if it doesn't exist
+    os.makedirs(MODELS_DIR, exist_ok=True)
 
+    return model_save_path
+
+
+def _convert_to_sft_dataset(
+    df: pd.DataFrame,
+    text_col: str = "text",
+    label_col: str = "label",
+) -> Dataset:
+    """
+    Convert DataFrame to SFT conversational dataset format.
+
+    Args:
+        df: DataFrame with 'text' and 'label' columns
+        text_col: Name of the text column (default: "text")
+        label_col: Name of the label column (default: "label")
+
+    Returns:
+        Dataset: HuggingFace Dataset with 'messages' format
+    """
+    if text_col not in df.columns:
+        raise ValueError(f"Column '{text_col}' not found in DataFrame")
+    if label_col not in df.columns:
+        raise ValueError(f"Column '{label_col}' not found in DataFrame")
+
+    system_msg = _get_sentiment_instruction()
+
+    def create_messages(row):
+        return {
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": str(row[text_col])},
+                {"role": "assistant", "content": str(row[label_col])},
+            ]
+        }
+
+    messages_list = df.apply(create_messages, axis=1).tolist()
+    return Dataset.from_list(messages_list)
+
+
+def train_llm_sft(
+    model_name: str,
+    df_train: pd.DataFrame,
+    df_val: Optional[pd.DataFrame] = None,
+    output_dir: Optional[str] = None,
+    training_args: Optional[TrainingArguments] = None,
+    **sft_config_kwargs,
+) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
+    """
+    Train an LLM model using Supervised Fine-Tuning (SFT).
+
+    Args:
+        model_name: Name/path of the base LLM model
+        df_train: Training DataFrame with 'text' and 'label' columns
+        df_val: Optional validation DataFrame with 'text' and 'label' columns
+        output_dir: Optional output directory for saving the model.
+            If None, uses MODELS_DIR/{model_name}_sft
+        training_args: Optional TrainingArguments. If None, uses defaults.
+        max_seq_length: Maximum sequence length for training
+        **sft_config_kwargs: Additional arguments to pass to SFTTrainer
+
+    Returns:
+        tuple: (trained_model, tokenizer)
+
+    Raises:
+        ImportError: If TRL is not installed
+        ValueError: If required columns are missing from DataFrames
+    """
+    if df_train is None or df_train.empty:
+        raise ValueError("df_train cannot be None or empty")
+    if "text" not in df_train.columns or "label" not in df_train.columns:
+        raise ValueError("df_train must contain 'text' and 'label' columns")
+
+    if df_val is not None:
+        if "text" not in df_val.columns or "label" not in df_val.columns:
+            raise ValueError("df_val must contain 'text' and 'label' columns")
+
+    # Prepare output directory
+    if output_dir is None:
+        output_dir = _prepare_sft_model_path(model_name)
+
+    print(f"Training model: {model_name}")
+    print(f"Output directory: {output_dir}")
+
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, trust_remote_code=True
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Convert datasets to SFT format
+    train_dataset = _convert_to_sft_dataset(df_train)
+    eval_dataset = (
+        _convert_to_sft_dataset(df_val) if df_val is not None else None
+    )
+
+    # Prepare training arguments
+    if training_args is None:
+        training_args = TrainingArguments(
+            output_dir=output_dir,
+            per_device_train_batch_size=DEFAULT_SFT_BATCH_SIZE,
+            per_device_eval_batch_size=DEFAULT_SFT_BATCH_SIZE,
+            num_train_epochs=DEFAULT_SFT_NUM_EPOCHS,
+            learning_rate=DEFAULT_SFT_LEARNING_RATE,
+            logging_steps=10,
+            eval_strategy="epoch" if eval_dataset is not None else "no",
+            save_strategy="epoch",
+            load_best_model_at_end=True if eval_dataset is not None else False,
+            report_to="none",
+            seed=42,
+            data_seed=42,
+        )
+
+    # Load model
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         device_map="auto",
@@ -277,7 +396,133 @@ def evaluate_llm(
         dtype=torch.bfloat16,
     )
 
-    model.eval()
+    # Create trainer with SFT-specific parameters
+    trainer = SFTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        processing_class=tokenizer,
+        **sft_config_kwargs,
+    )
+
+    # Train
+    print("Starting SFT training...")
+    trainer.train()
+
+    # Save model
+    trainer.save_model()
+    tokenizer.save_pretrained(output_dir)
+    print(f"Model saved to: {output_dir}")
+
+    return model, tokenizer
+
+
+def evaluate_llm(
+    model_name: str,
+    df: pd.DataFrame,
+    y: Optional[Union[np.ndarray, pd.Series, list[int]]] = None,
+    train_sft: bool = False,
+    df_train: Optional[pd.DataFrame] = None,
+    df_val: Optional[pd.DataFrame] = None,
+    output_dir: Optional[str] = None,
+    training_args: Optional[TrainingArguments] = None,
+    **sft_config_kwargs,
+) -> Tuple[Optional[float], np.ndarray]:
+    """
+    Evaluate an LLM model on a dataset, optionally with SFT training.
+
+    Args:
+        model_name: Name/path of the LLM model
+        df: DataFrame with 'text' column for evaluation
+        y: Optional labels for evaluation
+        train_sft: If True, fine-tune the model using SFT before evaluation
+        df_train: Training DataFrame with 'text' and 'label' columns.
+            Required if train_sft=True
+        df_val: Optional validation DataFrame with 'text' and 'label' columns
+            for SFT training
+        output_dir: Optional output directory for saving the SFT model.
+            If None and train_sft=True, uses MODELS_DIR/{model_name}_sft
+        training_args: Optional TrainingArguments for SFT training
+        **sft_config_kwargs: Additional arguments to pass to SFTTrainer
+
+    Returns:
+        tuple: (balanced_accuracy, predictions) or (None, predictions)
+            if y is None
+
+    Raises:
+        ValueError: If train_sft=True but df_train is not provided
+    """
+    # Validate inputs
+    if df is None or df.empty:
+        raise ValueError("df cannot be None or empty")
+    if "text" not in df.columns:
+        raise ValueError("df must contain a 'text' column")
+
+    if train_sft:
+        if df_train is None or df_train.empty:
+            raise ValueError(
+                "df_train is required when train_sft=True. "
+                "Provide a DataFrame with 'text' and 'label' columns."
+            )
+        # Train the model first
+        model, tokenizer = train_llm_sft(
+            model_name=model_name,
+            df_train=df_train,
+            df_val=df_val,
+            output_dir=output_dir,
+            training_args=training_args,
+            **sft_config_kwargs,
+        )
+        model.eval()
+    else:
+        # Check if a fine-tuned model exists, otherwise load base model
+        if output_dir is None:
+            potential_sft_path = _prepare_sft_model_path(model_name)
+        else:
+            potential_sft_path = output_dir
+
+        # Try to load fine-tuned model if it exists
+        safetensors_path = os.path.join(
+            potential_sft_path, "model.safetensors"
+        )
+        pytorch_model_path = os.path.join(
+            potential_sft_path, "pytorch_model.bin"
+        )
+        model_file_exists = (
+            os.path.exists(safetensors_path)
+            or os.path.exists(pytorch_model_path)
+        )
+        if os.path.exists(potential_sft_path) and model_file_exists:
+            print(f"Loading fine-tuned model from: {potential_sft_path}")
+            tokenizer = AutoTokenizer.from_pretrained(
+                potential_sft_path, trust_remote_code=True
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                potential_sft_path,
+                device_map="auto",
+                trust_remote_code=True,
+                dtype=torch.bfloat16,
+            )
+        else:
+            # Load base model
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name, trust_remote_code=True
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto",
+                trust_remote_code=True,
+                dtype=torch.bfloat16,
+            )
+        model.eval()
+
+    texts = df["text"].values
+    model_display_name = (
+        f"{model_name} (SFT)" if train_sft else model_name
+    )
+    print(f"Evaluating model: {model_display_name}")
+    print(f"Evaluating {len(texts)} samples...")
 
     # Evaluate if labels provided
     if y is not None:
@@ -285,14 +530,19 @@ def evaluate_llm(
         desc = "Processing validation texts"
         predictions = _process_texts_llm(texts, model, tokenizer, desc)
         balanced_acc = balanced_accuracy_score(y, predictions)
-        plot_confusion_matrix(y, predictions, f"{model_name} (LLM)")
+        plot_confusion_matrix(y, predictions, f"{model_display_name} (LLM)")
         return balanced_acc, predictions
 
     # Process test set if provided (without validation labels)
     test_texts = df["text"].values
     desc = "Processing test texts"
     test_predictions = _process_texts_llm(test_texts, model, tokenizer, desc)
-    _create_submission_file_direct(test_predictions, df, model_name)
+    submission_model_name = (
+        f"{model_name}_sft" if train_sft else model_name
+    )
+    _create_submission_file_direct(
+        test_predictions, df, submission_model_name
+    )
 
     return None, test_predictions
 
@@ -354,7 +604,9 @@ def evaluate_chatgpt(
     # Process test set if provided (without validation labels)
     test_texts = df["text"].values
     desc = "Processing test texts"
-    test_predictions = _process_texts_chatgpt(test_texts, client, model_name, desc)
+    test_predictions = _process_texts_chatgpt(
+        test_texts, client, model_name, desc
+    )
     _create_submission_file(test_predictions, df, model_name, "chatgpt")
 
     return None, test_predictions
