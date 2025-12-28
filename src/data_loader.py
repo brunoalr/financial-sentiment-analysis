@@ -12,6 +12,9 @@ from datasets import load_dataset
 
 from src.config import DATA_DIR, LABEL_MAPPING, REVERSE_LABEL_MAPPING
 
+# Valid numeric label values
+VALID_NUMERIC_LABELS = {0, 1, 2}
+
 
 def _is_huggingface_dataset(data_source: str) -> bool:
     """
@@ -24,16 +27,12 @@ def _is_huggingface_dataset(data_source: str) -> bool:
         bool: True if it appears to be a Hugging Face dataset name,
             False otherwise
     """
-    # Check if it's a valid local directory path first
+    # If it's a valid local directory path, it's not a HF dataset
     if os.path.exists(data_source) and os.path.isdir(data_source):
         return False
 
     # Hugging Face dataset names typically contain "/"
     # (e.g., "username/dataset-name") and don't exist as local paths
-    if "/" in data_source and not os.path.exists(data_source):
-        return True
-
-    # If it doesn't exist as a path and contains "/", assume it's a HF dataset
     return "/" in data_source
 
 
@@ -76,8 +75,9 @@ def load_datasets(
     # Determine if it's a Hugging Face dataset or a local directory
     if _is_huggingface_dataset(data_source):
         return _load_huggingface_dataset(data_source, label_mapping)
-    else:
-        return _load_csv_datasets(data_source)
+
+    # else
+    return _load_csv_datasets(data_source)
 
 
 def _load_csv_datasets(
@@ -129,6 +129,38 @@ def _load_csv_datasets(
     return df_train, df_val, df_test
 
 
+def _convert_numeric_labels_to_string(
+    df: pd.DataFrame, label_mapping: Dict[int, str]
+) -> None:
+    """
+    Convert numeric labels to string labels in-place if needed.
+
+    Args:
+        df: DataFrame with 'label' column to convert
+        label_mapping: Dictionary mapping numeric labels to string labels
+
+    Raises:
+        ValueError: If any numeric labels cannot be mapped
+    """
+    if "label" not in df.columns:
+        return
+
+    if not pd.api.types.is_numeric_dtype(df["label"]):
+        return
+
+    # Store original values for error reporting
+    original_labels = df["label"].copy()
+    # Convert numeric labels to string labels
+    df["label"] = df["label"].map(label_mapping)
+    # Check for any unmapped values
+    if df["label"].isna().any():
+        unmapped = original_labels[df["label"].isna()].unique()
+        raise ValueError(
+            f"Found unmapped numeric label(s): {unmapped}. "
+            f"Expected values: {list(label_mapping.keys())}"
+        )
+
+
 def _load_huggingface_dataset(
     dataset_name: str,
     label_mapping: Dict[int, str],
@@ -158,16 +190,10 @@ def _load_huggingface_dataset(
     # Get available splits
     available_splits = list(dataset_dict.keys())
 
-    # Try to find train, validation/val, and test splits
-    train_split = None
-    val_split = None
-    test_split = None
-
-    # Look for train split
+    # Find train split
     if "train" in available_splits:
         train_split = "train"
     elif len(available_splits) == 1:
-        # If only one split exists, assume it's the train split
         train_split = available_splits[0]
     else:
         raise ValueError(
@@ -175,74 +201,97 @@ def _load_huggingface_dataset(
             f"Available splits: {available_splits}"
         )
 
-    # Look for validation split (try both 'validation' and 'val')
-    if "validation" in available_splits:
-        val_split = "validation"
-    elif "val" in available_splits:
-        val_split = "val"
+    # Find validation and test splits (try preferred names first)
+    val_split = next(
+        (s for s in ["validation", "val"] if s in available_splits), None
+    )
+    test_split = "test" if "test" in available_splits else None
 
-    # Look for test split
-    if "test" in available_splits:
-        test_split = "test"
-
-    # If we only have train split, we need to split it
+    # Split dataset if needed (80/10/10)
     if val_split is None or test_split is None:
-        if len(dataset_dict[train_split]) == 0:
+        train_dataset = dataset_dict[train_split]
+        if len(train_dataset) == 0:
             raise ValueError(
                 f"Dataset '{dataset_name}' train split is empty. "
                 f"Cannot create train/val/test splits."
             )
 
-        # Split the train dataset into train/val/test (80/10/10)
-        train_dataset = dataset_dict[train_split]
-        split_dataset = train_dataset.train_test_split(
+        # Split train into train/remaining (80/20)
+        split_1 = train_dataset.train_test_split(
             test_size=0.2, seed=42, shuffle=True
         )
-        train_data = split_dataset["train"]
-        remaining_data = split_dataset["test"]
-
-        # Split remaining into val and test (50/50 of the 20%, so 10% each)
-        val_test_split = remaining_data.train_test_split(
+        # Split remaining into val/test (50/50 of 20%, so 10% each)
+        split_2 = split_1["test"].train_test_split(
             test_size=0.5, seed=42, shuffle=True
         )
-        val_data = val_test_split["train"]
-        test_data = val_test_split["test"]
 
-        df_train = train_data.to_pandas()
-        df_val = val_data.to_pandas()
-        df_test = test_data.to_pandas()
+        df_train = split_1["train"].to_pandas()
+        df_val = split_2["train"].to_pandas()
+        df_test = split_2["test"].to_pandas()
     else:
         # Use existing splits
         df_train = dataset_dict[train_split].to_pandas()
         df_val = dataset_dict[val_split].to_pandas()
         df_test = dataset_dict[test_split].to_pandas()
 
-    # Ensure column names match expected format (text, label)
-    # Hugging Face datasets might use different column names
-    # We'll keep the original columns but note that downstream code expects
-    # 'text' and 'label'. If the dataset uses different names, the user will
-    # need to rename them or we could add automatic mapping, but for now we'll
-    # keep it simple and let the user handle it
-
     # Convert numeric labels to string labels if needed
     for df in [df_train, df_val, df_test]:
-        if "label" in df.columns:
-            # Check if labels are numeric
-            if pd.api.types.is_numeric_dtype(df["label"]):
-                # Store original values for error reporting
-                original_labels = df["label"].copy()
-                # Convert numeric labels to string labels
-                df["label"] = df["label"].map(label_mapping)
-                # Check for any unmapped values
-                if df["label"].isna().any():
-                    unmapped = original_labels[df["label"].isna()].unique()
-                    raise ValueError(
-                        f"Found unmapped numeric label(s): {unmapped}. "
-                        f"Expected values: "
-                        f"{list(label_mapping.keys())}"
-                    )
+        _convert_numeric_labels_to_string(df, label_mapping)
 
     return df_train, df_val, df_test
+
+
+def _encode_single_label_column(
+    df: pd.DataFrame,
+    dataset_name: str = "dataset",
+    label_col: str = "label",
+) -> pd.Series:
+    """
+    Encode a single label column to numeric values.
+
+    Handles both string labels (e.g., 'neutral', 'positive', 'negative') and
+    numeric labels (e.g., 0, 1, 2). If labels are already numeric and in the
+    valid range [0, 1, 2], they are used directly. Otherwise, string labels
+    are mapped using LABEL_MAPPING.
+
+    Args:
+        df: DataFrame with label column to encode
+        dataset_name: Name of the dataset (for error messages)
+        label_col: Name of the label column (default: "label")
+
+    Returns:
+        pd.Series: Encoded labels as numeric values
+
+    Raises:
+        ValueError: If any labels cannot be mapped to numeric values or are
+            outside the valid range [0, 1, 2]
+    """
+    labels = df[label_col]
+
+    # Check if labels are numeric
+    if pd.api.types.is_numeric_dtype(labels):
+        # Validate numeric labels are in valid range
+        unique_labels = set(labels.unique())
+        if not unique_labels.issubset(VALID_NUMERIC_LABELS):
+            invalid = unique_labels - VALID_NUMERIC_LABELS
+            raise ValueError(
+                f"Found invalid numeric label(s) in {dataset_name}: "
+                f"{invalid}. Expected values: {VALID_NUMERIC_LABELS}"
+            )
+        return labels.astype(int)
+
+    # else
+    # Map string labels to numeric
+    encoded = df[label_col].map(LABEL_MAPPING)
+    nan_count = encoded.isna().sum()
+    if nan_count > 0:
+        unmapped_labels = df[encoded.isna()][label_col].unique()
+        raise ValueError(
+            f"Found {nan_count} unmapped label(s) in {dataset_name}: "
+            f"{unmapped_labels}. Expected labels: "
+            f"{list(LABEL_MAPPING.keys())}"
+        )
+    return encoded
 
 
 def encode_labels(
@@ -270,62 +319,13 @@ def encode_labels(
         ValueError: If any labels cannot be mapped to numeric values or are
             outside the valid range [0, 1, 2]
     """
-    # Check if labels are already numeric
-    train_labels = df_train["label"]
-    val_labels = df_val["label"]
-
-    # Determine if labels are numeric
-    train_is_numeric = pd.api.types.is_numeric_dtype(train_labels)
-    val_is_numeric = pd.api.types.is_numeric_dtype(val_labels)
-
-    # If labels are numeric, validate and use directly
-    if train_is_numeric:
-        train_unique = set(train_labels.unique())
-        valid_numeric = {0, 1, 2}
-        if not train_unique.issubset(valid_numeric):
-            invalid = train_unique - valid_numeric
-            raise ValueError(
-                f"Found invalid numeric label(s) in training set: {invalid}. "
-                f"Expected values: {valid_numeric}"
-            )
-        df_train["label_encoded"] = train_labels.astype(int)
-    else:
-        # Map string labels to numeric
-        df_train["label_encoded"] = df_train["label"].map(LABEL_MAPPING)
-        train_nan_count = df_train["label_encoded"].isna().sum()
-        if train_nan_count > 0:
-            unmapped_labels = (
-                df_train[df_train["label_encoded"].isna()]["label"].unique()
-            )
-            raise ValueError(
-                f"Found {train_nan_count} unmapped label(s) in training set: "
-                f"{unmapped_labels}. Expected labels: "
-                f"{list(LABEL_MAPPING.keys())}"
-            )
-
-    if val_is_numeric:
-        val_unique = set(val_labels.unique())
-        valid_numeric = {0, 1, 2}
-        if not val_unique.issubset(valid_numeric):
-            invalid = val_unique - valid_numeric
-            raise ValueError(
-                f"Found invalid numeric label(s) in validation set: "
-                f"{invalid}. Expected values: {valid_numeric}"
-            )
-        df_val["label_encoded"] = val_labels.astype(int)
-    else:
-        # Map string labels to numeric
-        df_val["label_encoded"] = df_val["label"].map(LABEL_MAPPING)
-        val_nan_count = df_val["label_encoded"].isna().sum()
-        if val_nan_count > 0:
-            unmapped_labels = (
-                df_val[df_val["label_encoded"].isna()]["label"].unique()
-            )
-            raise ValueError(
-                f"Found {val_nan_count} unmapped label(s) in validation set: "
-                f"{unmapped_labels}. Expected labels: "
-                f"{list(LABEL_MAPPING.keys())}"
-            )
+    # Encode train and validation labels
+    df_train["label_encoded"] = _encode_single_label_column(
+        df_train, dataset_name="training set"
+    )
+    df_val["label_encoded"] = _encode_single_label_column(
+        df_val, dataset_name="validation set"
+    )
 
     y_train = df_train["label_encoded"]
     y_val = df_val["label_encoded"]
@@ -336,32 +336,9 @@ def encode_labels(
             y_test = pd.Series([0] * len(df_test), index=df_test.index)
             return y_train, y_val, y_test
 
-        test_labels = df_test["label"]
-        test_is_numeric = pd.api.types.is_numeric_dtype(test_labels)
-
-        if test_is_numeric:
-            test_unique = set(test_labels.unique())
-            valid_numeric = {0, 1, 2}
-            if not test_unique.issubset(valid_numeric):
-                invalid = test_unique - valid_numeric
-                raise ValueError(
-                    f"Found invalid numeric label(s) in test set: {invalid}. "
-                    f"Expected values: {valid_numeric}"
-                )
-            df_test["label_encoded"] = test_labels.astype(int)
-        else:
-            df_test["label_encoded"] = df_test["label"].map(LABEL_MAPPING)
-            test_nan_count = df_test["label_encoded"].isna().sum()
-            if test_nan_count > 0:
-                unmapped_labels = (
-                    df_test[df_test["label_encoded"].isna()]["label"].unique()
-                )
-                raise ValueError(
-                    f"Found {test_nan_count} unmapped label(s) in test set: "
-                    f"{unmapped_labels}. Expected labels: "
-                    f"{list(LABEL_MAPPING.keys())}"
-                )
-
+        df_test["label_encoded"] = _encode_single_label_column(
+            df_test, dataset_name="test set"
+        )
         y_test = df_test["label_encoded"]
         return y_train, y_val, y_test
 
