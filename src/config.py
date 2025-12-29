@@ -76,6 +76,16 @@ TFIDF_MAX_FEATURES: int = 5000
 # Transformer parameters
 TRANSFORMER_MAX_LEN: int = 64
 
+# Default SFT training parameters
+DEFAULT_SFT_LEARNING_RATE: float = 2e-5
+DEFAULT_SFT_BATCH_SIZE: int = 8
+DEFAULT_SFT_NUM_EPOCHS: int = 3
+DEFAULT_SFT_MAX_SEQ_LENGTH: int = 64
+
 # Label mapping
-LABEL_MAPPING: Dict[str, int] = {"neutral": 0, "positive": 1, "negative": 2}
-REVERSE_LABEL_MAPPING: Dict[int, str] = {0: "neutral", 1: "positive", 2: "negative"}
+LABEL_MAPPING: dict[str, int] = {"neutral": 0, "positive": 1, "negative": 2}
+REVERSE_LABEL_MAPPING: dict[int, str] = {
+    0: "neutral",
+    1: "positive",
+    2: "negative",
+}

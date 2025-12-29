@@ -93,6 +93,7 @@ opt_einsum>=3.4.0
 optree>=0.18.0
 packaging>=25.0
 pandas>=2.3.3
+peft>=0.13.0
 pandocfilters>=1.5.1
 parso>=0.8.5
 pexpect>=4.9.0

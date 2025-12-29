@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import gc
 import os
+import shutil
 import time
 from typing import Optional, Tuple, Union
 
@@ -18,9 +19,16 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 
 from datasets import Dataset
-from trl import SFTTrainer
+from peft import LoraConfig, TaskType
+from trl import SFTConfig, SFTTrainer
 
-from src.config import MODELS_DIR, SUBMISSIONS_DIR
+from src.config import (
+    DEFAULT_SFT_BATCH_SIZE,
+    DEFAULT_SFT_LEARNING_RATE,
+    DEFAULT_SFT_NUM_EPOCHS,
+    MODELS_DIR,
+    SUBMISSIONS_DIR,
+)
 from src.evaluation import plot_confusion_matrix
 from src.submission import generate_submission
 from src.utils import get_device
@@ -42,12 +50,6 @@ def _clear_memory_cache() -> None:
 
 # Constants
 DEFAULT_NEUTRAL_LABEL = "   Defaulting to neutral (0)"
-
-# Default SFT training parameters
-DEFAULT_SFT_LEARNING_RATE = 2e-5
-DEFAULT_SFT_BATCH_SIZE = 8
-DEFAULT_SFT_NUM_EPOCHS = 3
-DEFAULT_SFT_MAX_SEQ_LENGTH = 64
 
 
 def _get_sentiment_instruction() -> str:
@@ -336,6 +338,8 @@ def train_llm_sft(
     df_val: Optional[pd.DataFrame] = None,
     output_dir: Optional[str] = None,
     training_args: Optional[TrainingArguments] = None,
+    use_peft: Optional[bool] = None,
+    peft_config: Optional[LoraConfig] = None,
     **sft_config_kwargs,
 ) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
     """
@@ -348,16 +352,23 @@ def train_llm_sft(
         output_dir: Optional output directory for saving the model.
             If None, uses MODELS_DIR/{model_name}_sft
         training_args: Optional TrainingArguments. If None, uses defaults.
-        max_seq_length: Maximum sequence length for training
-        **sft_config_kwargs: Additional arguments to pass to SFTTrainer
+        use_peft: Whether to use PEFT (Parameter-Efficient Fine-Tuning).
+            Defaults to True for memory efficiency.
+        peft_config: Optional PEFT configuration. If None and use_peft=True,
+            creates a default LoRA configuration.
+        **sft_config_kwargs: Additional arguments to pass to SFTConfig
 
     Returns:
         tuple: (trained_model, tokenizer)
 
     Raises:
-        ImportError: If TRL is not installed
+        ImportError: If TRL or PEFT is not installed when needed
         ValueError: If required columns are missing from DataFrames
     """
+    # Set default values
+    if use_peft is None:
+        use_peft = True
+
     if df_train is None or df_train.empty:
         raise ValueError("df_train cannot be None or empty")
     if "text" not in df_train.columns or "label" not in df_train.columns:
@@ -370,6 +381,15 @@ def train_llm_sft(
     # Prepare output directory
     if output_dir is None:
         output_dir = _prepare_sft_model_path(model_name)
+
+    # Remove existing model directory if it exists to ensure clean overwrite
+    if os.path.exists(output_dir):
+        print(
+            f"Removing existing model at {output_dir} "
+            "to ensure clean overwrite..."
+        )
+        shutil.rmtree(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
 
     print(f"Training model: {model_name}")
     print(f"Output directory: {output_dir}")
@@ -387,22 +407,56 @@ def train_llm_sft(
         _convert_to_sft_dataset(df_val) if df_val is not None else None
     )
 
-    # Prepare training arguments
-    if training_args is None:
-        training_args = TrainingArguments(
-            output_dir=output_dir,
-            per_device_train_batch_size=DEFAULT_SFT_BATCH_SIZE,
-            per_device_eval_batch_size=DEFAULT_SFT_BATCH_SIZE,
-            num_train_epochs=DEFAULT_SFT_NUM_EPOCHS,
-            learning_rate=DEFAULT_SFT_LEARNING_RATE,
-            logging_steps=10,
-            eval_strategy="epoch" if eval_dataset is not None else "no",
-            save_strategy="epoch",
-            load_best_model_at_end=True if eval_dataset is not None else False,
-            report_to="none",
-            seed=42,
-            data_seed=42,
-        )
+    # Prepare SFTConfig - merge training args with SFT-specific parameters
+    # According to TRL docs, SFTConfig should be passed as 'args' to SFTTrainer
+    # SFTConfig accepts both TrainingArguments params and SFT-specific params
+    sft_config_dict = {
+        "output_dir": output_dir,
+        "per_device_train_batch_size": DEFAULT_SFT_BATCH_SIZE,
+        "per_device_eval_batch_size": DEFAULT_SFT_BATCH_SIZE,
+        "num_train_epochs": DEFAULT_SFT_NUM_EPOCHS,
+        "learning_rate": DEFAULT_SFT_LEARNING_RATE,
+        "logging_steps": 10,
+        "eval_strategy": "epoch" if eval_dataset is not None else "no",
+        "save_strategy": "epoch",
+        "load_best_model_at_end": (
+            True if eval_dataset is not None else False
+        ),
+        "report_to": "none",
+        "seed": 42,
+        "data_seed": 42,
+    }
+
+    # If training_args was provided, extract its parameters
+    if training_args is not None:
+        # Convert TrainingArguments to dict and update sft_config_dict
+        training_args_dict = training_args.to_dict()
+        sft_config_dict.update(training_args_dict)
+
+    # Add SFT-specific parameters from kwargs (like loss_type, max_seq_length)
+    sft_config_dict.update(sft_config_kwargs)
+
+    # Create SFTConfig
+    sft_config = SFTConfig(**sft_config_dict)
+
+    # Prepare PEFT config if needed
+    if use_peft:
+        if peft_config is None:
+            # Create default LoRA configuration
+            # This is memory-efficient and works well for most models
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=16,  # LoRA rank
+                lora_alpha=32,  # LoRA alpha scaling
+                lora_dropout=0.05,  # LoRA dropout
+                bias="none",  # Don't train bias
+                target_modules=None,  # Auto-detect target modules
+            )
+            print("Using default LoRA configuration for PEFT")
+        else:
+            print("Using provided PEFT configuration")
+    else:
+        peft_config = None
 
     # Load model
     model = AutoModelForCausalLM.from_pretrained(
@@ -412,14 +466,16 @@ def train_llm_sft(
         dtype=torch.bfloat16,
     )
 
-    # Create trainer with SFT-specific parameters
+    # Create trainer with SFTConfig as args
+    # According to TRL docs, SFTConfig is passed as 'args'
+    # PEFT config is passed as 'peft_config' parameter
     trainer = SFTTrainer(
         model=model,
-        args=training_args,
+        args=sft_config,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
-        **sft_config_kwargs,
+        peft_config=peft_config,
     )
 
     # Train
@@ -442,11 +498,13 @@ def evaluate_llm(
     model_name: str,
     df: pd.DataFrame,
     y: Optional[Union[np.ndarray, pd.Series, list[int]]] = None,
-    train_sft: bool = False,
+    train_sft: Optional[bool] = None,
     df_train: Optional[pd.DataFrame] = None,
     df_val: Optional[pd.DataFrame] = None,
     output_dir: Optional[str] = None,
     training_args: Optional[TrainingArguments] = None,
+    use_peft: Optional[bool] = None,
+    peft_config: Optional[LoraConfig] = None,
     **sft_config_kwargs,
 ) -> Tuple[Optional[float], np.ndarray]:
     """
@@ -457,6 +515,7 @@ def evaluate_llm(
         df: DataFrame with 'text' column for evaluation
         y: Optional labels for evaluation
         train_sft: If True, fine-tune the model using SFT before evaluation
+            (default: False)
         df_train: Training DataFrame with 'text' and 'label' columns.
             Required if train_sft=True
         df_val: Optional validation DataFrame with 'text' and 'label' columns
@@ -464,7 +523,11 @@ def evaluate_llm(
         output_dir: Optional output directory for saving the SFT model.
             If None and train_sft=True, uses MODELS_DIR/{model_name}_sft
         training_args: Optional TrainingArguments for SFT training
-        **sft_config_kwargs: Additional arguments to pass to SFTTrainer
+        use_peft: Whether to use PEFT (Parameter-Efficient Fine-Tuning).
+            Defaults to False
+        peft_config: Optional PEFT configuration. If None and use_peft=True,
+            creates a default LoRA configuration.
+        **sft_config_kwargs: Additional arguments to pass to SFTConfig
 
     Returns:
         tuple: (balanced_accuracy, predictions) or (None, predictions)
@@ -473,6 +536,12 @@ def evaluate_llm(
     Raises:
         ValueError: If train_sft=True but df_train is not provided
     """
+    # Set default values
+    if train_sft is None:
+        train_sft = False
+    if use_peft is None:
+        use_peft = False
+
     _clear_memory_cache()
     # Validate inputs
     if df is None or df.empty:
@@ -488,13 +557,15 @@ def evaluate_llm(
             )
         # Train the model first
         model, tokenizer = train_llm_sft(
-            model_name=model_name,
-            df_train=df_train,
-            df_val=df_val,
-            output_dir=output_dir,
-            training_args=training_args,
-            **sft_config_kwargs,
-        )
+                model_name=model_name,
+                df_train=df_train,
+                df_val=df_val,
+                output_dir=output_dir,
+                training_args=training_args,
+                use_peft=use_peft,
+                peft_config=peft_config,
+                **sft_config_kwargs,
+            )
         model.eval()
     else:
         # Check if a fine-tuned model exists, otherwise load base model
@@ -539,9 +610,10 @@ def evaluate_llm(
         model.eval()
 
     texts = df["text"].values
-    model_display_name = (
-        f"{model_name} (SFT)" if train_sft else model_name
-    )
+    if train_sft:
+        model_display_name = f"{model_name} (SFT)"
+    else:
+        model_display_name = model_name
     print(f"Evaluating model: {model_display_name}")
     print(f"Evaluating {len(texts)} samples...")
 
